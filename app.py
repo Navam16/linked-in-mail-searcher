@@ -4,7 +4,7 @@ LinkedIn Job Post Scraper & Extractor
 A Streamlit dashboard that:
 1. Takes a natural language search prompt from the user.
 2. Converts it to a Google Dork query (site:linkedin.com/posts) via Serper API.
-3. Passes each result snippet to Claude (Anthropic) to extract structured job data.
+3. Passes each result snippet to Groq LLM to extract structured job data.
 4. Displays results in a table and allows Excel export.
 
 Author: Generated for Hi | IIT Mandi MBA (Data Science & AI)
@@ -16,7 +16,7 @@ import pandas as pd
 import json
 import io
 import time
-import anthropic
+from groq import Groq
 
 # ──────────────────────────────────────────────
 # PAGE CONFIG
@@ -153,10 +153,6 @@ section[data-testid="stSidebar"] {
     overflow: hidden;
 }
 
-/* Status badge */
-.badge-ok  { color: #34d399; font-weight: 700; font-family: 'IBM Plex Mono', monospace; }
-.badge-err { color: #f87171; font-weight: 700; font-family: 'IBM Plex Mono', monospace; }
-
 /* Expander tweak */
 details summary { color: #94a3b8 !important; }
 </style>
@@ -175,11 +171,11 @@ with st.sidebar:
         placeholder="sk-serper-xxxxxxxx",
         help="Get your key at https://serper.dev"
     )
-    anthropic_key = st.text_input(
-        "Anthropic API Key",
+    groq_key = st.text_input(
+        "Groq API Key",
         type="password",
-        placeholder="sk-ant-xxxxxxxx",
-        help="Get your key at https://console.anthropic.com"
+        placeholder="gsk_xxxxxxxx",
+        help="Get your key at https://console.groq.com"
     )
 
     st.divider()
@@ -192,7 +188,7 @@ with st.sidebar:
     **How it works**
     1. Your prompt → Google Dork on `site:linkedin.com/posts`
     2. Serper fetches results
-    3. Claude extracts structured data per snippet
+    3. Groq LLM extracts structured data per snippet
     4. Results compiled & exported as `.xlsx`
     """)
 
@@ -212,10 +208,10 @@ st.markdown("""
 def build_dork_query(user_prompt: str) -> str:
     """
     Converts a free-form user prompt into a Google Dork query scoped to
-    LinkedIn posts. The LLM (Claude) is used here to intelligently pick
-    the best keywords and dork structure from the user's intent.
+    LinkedIn posts. Groq LLM intelligently picks the best keywords and
+    dork structure from the user's intent.
     """
-    client = anthropic.Anthropic(api_key=anthropic_key)
+    client = Groq(api_key=groq_key)
 
     system = """You are a Google search dork expert. Given a user's job search intent,
 produce a single Google search query that:
@@ -225,13 +221,15 @@ produce a single Google search query that:
 - Keeps the query concise (under 15 words after the site: operator)
 - Returns ONLY the raw query string, nothing else."""
 
-    response = client.messages.create(
-        model="claude-sonnet-4-20250514",
+    response = client.chat.completions.create(
+        model="llama-3.3-70b-versatile",
         max_tokens=100,
-        system=system,
-        messages=[{"role": "user", "content": f"User intent: {user_prompt}"}]
+        messages=[
+            {"role": "system", "content": system},
+            {"role": "user", "content": f"User intent: {user_prompt}"}
+        ]
     )
-    return response.content[0].text.strip()
+    return response.choices[0].message.content.strip()
 
 
 # ──────────────────────────────────────────────
@@ -259,18 +257,17 @@ def search_serper(query: str, num: int) -> list[dict]:
 # ──────────────────────────────────────────────
 def extract_job_data(snippet: str, title: str, link: str) -> dict | None:
     """
-    Sends a snippet + title to Claude with a strict JSON-only prompt.
+    Sends a snippet + title to Groq LLM with a strict JSON-only prompt.
 
     The prompt enforces JSON output by:
     1. Specifying the EXACT keys required (email, job_role, location, experience)
     2. Telling the model to return "Not Found" for missing fields — never null or empty
-    3. Prefixing the assistant turn with '{' to force the model to start JSON immediately
-       (this is a common "JSON forcing" technique with Claude)
-    4. Using a low max_tokens to prevent rambling prose before the JSON
+    3. Using "Return ONLY valid JSON" + "No explanation, no markdown" to stop preamble
+    4. Low max_tokens to prevent rambling prose before the JSON
 
     Returns a dict or None if extraction fails / no email found.
     """
-    client = anthropic.Anthropic(api_key=anthropic_key)
+    client = Groq(api_key=groq_key)
 
     # ── THE EXTRACTION PROMPT ──────────────────────────────────────────────
     # Key design decisions:
@@ -302,13 +299,15 @@ Post snippet: {snippet}
 Extract the 4 fields now."""
 
     try:
-        response = client.messages.create(
-            model="claude-sonnet-4-20250514",
+        response = client.chat.completions.create(
+            model="llama-3.3-70b-versatile",
             max_tokens=200,
-            system=system_prompt,
-            messages=[{"role": "user", "content": user_prompt}]
+            messages=[
+                {"role": "system", "content": system_prompt},
+                {"role": "user", "content": user_prompt}
+            ]
         )
-        raw = response.content[0].text.strip()
+        raw = response.choices[0].message.content.strip()
 
         # Strip any accidental markdown fences
         raw = raw.replace("```json", "").replace("```", "").strip()
@@ -327,7 +326,7 @@ Extract the 4 fields now."""
 
         return extracted
 
-    except (json.JSONDecodeError, KeyError, anthropic.APIError):
+    except (json.JSONDecodeError, KeyError, Exception):
         return None
 
 
@@ -354,8 +353,8 @@ if run_search:
     if not serper_key:
         st.error("⚠️ Please enter your Serper API key in the sidebar.")
         st.stop()
-    if not anthropic_key:
-        st.error("⚠️ Please enter your Anthropic API key in the sidebar.")
+    if not groq_key:
+        st.error("⚠️ Please enter your Groq API key in the sidebar.")
         st.stop()
     if not user_prompt.strip():
         st.warning("Please enter a search prompt.")
@@ -409,7 +408,6 @@ if run_search:
     extracted_rows = []
     skipped        = 0
     progress_bar   = st.progress(0, text="Extracting job data from snippets...")
-    status_cols    = st.columns(4)
 
     for i, result in enumerate(results):
         snippet = result.get("snippet", "")
